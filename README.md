@@ -38,12 +38,32 @@ Connect your ANT+ USB receiver and run:
 ```
 
 The script will:
-1. Search for ANT+ fitness equipment devices with ID 13500
+1. Search for ANT+ fitness equipment devices with ID 13500 (default)
 2. Display the current speed in large text on the terminal
 3. Update the display in real-time as speed changes
 
 Press Ctrl+C to exit the program.
 
+### Command-line Options
+
+You can specify a different device ID using the command-line:
+
+```
+./speed_display.py --device-id 12345
+```
+
+Or using the short form:
+
+```
+./speed_display.py -d 12345
+```
+
+To see all available options:
+
+```
+./speed_display.py --help
+```
+
 ## Customization
 
-You can modify the `TARGET_DEVICE_ID` variable in the script if your fitness equipment uses a different device ID. 
+You can modify the appearance of the display by editing the `BIG_NUMBERS` dictionary in the script. 

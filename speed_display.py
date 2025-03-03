@@ -2,13 +2,14 @@
 """
 ANT+ Speed Display for Fitness Equipment
 Displays speed data from ANT+ fitness equipment in large text on the terminal
-Specifically looks for devices with ID 13500
+Specifically looks for devices with ID 13500 by default
 """
 
 import sys
 import time
 import os
 import signal
+import argparse
 from datetime import datetime
 import logging
 
@@ -26,8 +27,8 @@ logging.basicConfig(level=logging.WARN,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('ant_scanner')
 
-# Target device ID
-TARGET_DEVICE_ID = 13500
+# Default target device ID
+DEFAULT_DEVICE_ID = 13500
 
 # ASCII art numbers for big text display
 BIG_NUMBERS = {
@@ -213,16 +214,33 @@ def cleanup():
         except:
             pass
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Display speed data from ANT+ fitness equipment in large text.'
+    )
+    parser.add_argument(
+        '-d', '--device-id', 
+        type=int, 
+        default=DEFAULT_DEVICE_ID,
+        help=f'ANT+ device ID to connect to (default: {DEFAULT_DEVICE_ID})'
+    )
+    return parser.parse_args()
+
 def main():
     """Main function to display speed from ANT+ fitness equipment."""
     global node, fitness_equipment
+    
+    # Parse command line arguments
+    args = parse_arguments()
+    device_id = args.device_id
     
     # Set up signal handler for clean exit
     signal.signal(signal.SIGINT, signal_handler)
     
     print("ANT+ Fitness Equipment Speed Display")
     print("------------------------------------")
-    print(f"Looking for devices with ID: {TARGET_DEVICE_ID}")
+    print(f"Looking for devices with ID: {device_id}")
     
     try:
         # Initialize ANT+ node
@@ -231,7 +249,7 @@ def main():
         node.set_network_key(0x00, ANTPLUS_NETWORK_KEY)
         
         # Set up Fitness Equipment device
-        fitness_equipment = FitnessEquipment(node, device_id=TARGET_DEVICE_ID)
+        fitness_equipment = FitnessEquipment(node, device_id=device_id)
         fitness_equipment.on_device_data = on_fitness_equipment_data
         fitness_equipment.on_found = lambda: on_device_found(fitness_equipment)
         
