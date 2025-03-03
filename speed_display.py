@@ -1,7 +1,8 @@
 #!./venv/bin/python3
 """
-ANT+ Device Scanner for Fitness Equipment
-Specifically looks for devices with ID 13500 and displays speed in big text
+ANT+ Speed Display for Fitness Equipment
+Displays speed data from ANT+ fitness equipment in large text on the terminal
+Specifically looks for devices with ID 13500
 """
 
 import sys
@@ -213,7 +214,7 @@ def cleanup():
             pass
 
 def main():
-    """Main function to scan for specific ANT+ devices."""
+    """Main function to display speed from ANT+ fitness equipment."""
     global node, fitness_equipment
     
     # Set up signal handler for clean exit
