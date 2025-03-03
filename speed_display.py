@@ -11,9 +11,11 @@ import time
 import os
 import signal
 import argparse
+import sqlite3
 from datetime import datetime
 import logging
-from typing import Optional, Dict, List, Callable, Any
+from typing import Optional, Dict, List, Callable, Any, Tuple
+from pathlib import Path
 
 try:
     from openant.easy.node import Node
@@ -35,6 +37,10 @@ DEFAULT_DEVICE_ID = 13500
 # Conversion constants
 KM_TO_MILES = 0.621371  # Conversion factor from kilometers to miles
 MS_TO_KMH = 3.6  # Conversion factor from m/s to km/h
+
+# Database constants
+DEFAULT_DB_PATH = os.path.expanduser("~/.ant_speed_display.db")
+DB_TABLE_NAME = "daily_distance"
 
 # ASCII art numbers for big text display
 BIG_NUMBERS = {
@@ -149,21 +155,191 @@ BIG_NUMBERS = {
 }
 
 
+class Database:
+    """Database manager for storing daily distance data."""
+    
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        """Initialize the database connection."""
+        self.db_path = db_path
+        self.conn = None
+        self.cursor = None
+        
+    def connect(self) -> bool:
+        """Connect to the SQLite database."""
+        try:
+            # Create directory if it doesn't exist
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir)
+                
+            # Connect to database
+            self.conn = sqlite3.connect(self.db_path)
+            self.cursor = self.conn.cursor()
+            
+            # Create tables if they don't exist
+            self._create_tables()
+            return True
+        except Exception as e:
+            logger.error(f"Error connecting to database: {e}")
+            return False
+    
+    def _create_tables(self) -> None:
+        """Create necessary tables if they don't exist."""
+        try:
+            self.cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {DB_TABLE_NAME} (
+                    date TEXT PRIMARY KEY,
+                    device_id INTEGER NOT NULL,
+                    distance REAL NOT NULL,
+                    last_updated TIMESTAMP NOT NULL
+                )
+            ''')
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
+    
+    def _cleanup_old_data(self) -> None:
+        """Remove data older than yesterday."""
+        try:
+            # Get today and yesterday's dates in ISO format (YYYY-MM-DD)
+            today = datetime.now().date().isoformat()
+            yesterday = (datetime.now().date() - datetime.timedelta(days=1)).isoformat()
+            
+            # Delete all records except today and yesterday
+            self.cursor.execute(
+                f"DELETE FROM {DB_TABLE_NAME} WHERE date != ? AND date != ?",
+                (today, yesterday)
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error cleaning up old data: {e}")
+    
+    def get_today_distance(self, device_id: int) -> float:
+        """Get the total distance for today with this device."""
+        try:
+            today = datetime.now().date().isoformat()
+            self.cursor.execute(
+                f"SELECT distance FROM {DB_TABLE_NAME} WHERE date = ? AND device_id = ?",
+                (today, device_id)
+            )
+            result = self.cursor.fetchone()
+            return result[0] if result else 0.0
+        except Exception as e:
+            logger.error(f"Error getting today's distance: {e}")
+            return 0.0
+    
+    def get_yesterday_distance(self, device_id: int) -> float:
+        """Get the total distance for yesterday with this device."""
+        try:
+            yesterday = (datetime.now().date() - datetime.timedelta(days=1)).isoformat()
+            self.cursor.execute(
+                f"SELECT distance FROM {DB_TABLE_NAME} WHERE date = ? AND device_id = ?",
+                (yesterday, device_id)
+            )
+            result = self.cursor.fetchone()
+            return result[0] if result else 0.0
+        except Exception as e:
+            logger.error(f"Error getting yesterday's distance: {e}")
+            return 0.0
+    
+    def update_today_distance(self, device_id: int, distance: float) -> bool:
+        """Update today's distance if the new distance is significant (> 0.02 miles)."""
+        if distance <= 0.02:
+            logger.debug(f"Distance {distance} is too small to record (≤ 0.02 miles)")
+            return False
+            
+        try:
+            today = datetime.now().date().isoformat()
+            now = datetime.now()
+            
+            # Check if we already have a record for today
+            self.cursor.execute(
+                f"SELECT distance FROM {DB_TABLE_NAME} WHERE date = ? AND device_id = ?",
+                (today, device_id)
+            )
+            result = self.cursor.fetchone()
+            
+            if result:
+                # Update existing record
+                self.cursor.execute(
+                    f"UPDATE {DB_TABLE_NAME} SET distance = distance + ?, last_updated = ? WHERE date = ? AND device_id = ?",
+                    (distance, now, today, device_id)
+                )
+            else:
+                # Insert new record
+                self.cursor.execute(
+                    f"INSERT INTO {DB_TABLE_NAME} (date, device_id, distance, last_updated) VALUES (?, ?, ?, ?)",
+                    (today, device_id, distance, now)
+                )
+            
+            self.conn.commit()
+            
+            # Clean up old data
+            self._cleanup_old_data()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating today's distance: {e}")
+            return False
+    
+    def get_stats(self) -> List[Tuple]:
+        """Get statistics for today and yesterday."""
+        try:
+            today = datetime.now().date().isoformat()
+            yesterday = (datetime.now().date() - datetime.timedelta(days=1)).isoformat()
+            
+            self.cursor.execute(
+                f"SELECT device_id, date, distance, last_updated FROM {DB_TABLE_NAME} "
+                f"WHERE date = ? OR date = ? ORDER BY date DESC, device_id",
+                (today, yesterday)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            return []
+    
+    def close(self) -> None:
+        """Close the database connection."""
+        try:
+            if self.conn:
+                self.conn.close()
+        except Exception as e:
+            logger.error(f"Error closing database: {e}")
+
+
 class SpeedDisplayApp:
     """Main application class for ANT+ Speed Display."""
     
-    def __init__(self, device_id: int = DEFAULT_DEVICE_ID):
+    def __init__(self, device_id: int = DEFAULT_DEVICE_ID, db_path: str = DEFAULT_DB_PATH):
         """Initialize the application with the specified device ID."""
         self.device_id = device_id
         self.node: Optional[Node] = None
         self.fitness_equipment: Optional[FitnessEquipment] = None
         self.exit_flag = False
-        self.total_distance = 0.0  # Total distance in miles
+        self.total_distance = 0.0  # Total distance in miles for current session
         self.last_update_time: Optional[float] = None  # Last time we received speed data
         self.current_speed = 0.0  # Current speed in mph
         self.connection_attempts = 0
         self.max_connection_attempts = 5
         self.reconnect_delay = 2  # seconds
+        
+        # Statistics tracking
+        self.max_speed = 0.0
+        self.speed_sum = 0.0
+        self.speed_count = 0
+        self.session_start_time = time.time()
+        
+        # Database setup
+        self.db = Database(db_path)
+        self.db_connected = self.db.connect()
+        
+        if self.db_connected:
+            # Load today's and yesterday's distance
+            self.today_distance = self.db.get_today_distance(device_id)
+            self.yesterday_distance = self.db.get_yesterday_distance(device_id)
+        else:
+            self.today_distance = 0.0
+            self.yesterday_distance = 0.0
+            logger.warning("Database connection failed. Distance will not be saved.")
         
         # Set up signal handler for clean exit
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -210,12 +386,12 @@ class SpeedDisplayApp:
         print("\n")  # Add space between speed and distance
         
         # Print distance header
-        print("DISTANCE:")
+        print("DISTANCE (session / today / yesterday):")
         
         # Print distance with units
         for i, line in enumerate(distance_lines):
             if i == 3:  # Middle line, add units
-                print(f"{line}  mi")
+                print(f"{line}  mi / {self.today_distance + self.total_distance:.2f} mi / {self.yesterday_distance:.2f} mi")
             else:
                 print(line)
         
@@ -240,6 +416,19 @@ class SpeedDisplayApp:
         except Exception as e:
             logger.error(f"Error updating display: {e}")
     
+    def update_statistics(self) -> None:
+        """Update workout statistics."""
+        try:
+            # Update max speed
+            if self.current_speed > self.max_speed:
+                self.max_speed = self.current_speed
+            
+            # Update average speed calculation
+            self.speed_sum += self.current_speed
+            self.speed_count += 1
+        except Exception as e:
+            logger.error(f"Error updating statistics: {e}")
+    
     def on_fitness_equipment_data(self, page: int, page_name: str, data: FitnessEquipmentData) -> None:
         """Callback for receiving fitness equipment data."""
         try:
@@ -260,6 +449,9 @@ class SpeedDisplayApp:
                 
                 # Update last update time
                 self.last_update_time = current_time
+                
+                # Update statistics
+                self.update_statistics()
                 
                 # Update display
                 self.update_display()
@@ -283,13 +475,25 @@ class SpeedDisplayApp:
         
         # Show final stats
         print(f"\nFinal Stats:")
-        print(f"Total Distance: {self.total_distance:.2f} miles")
+        print(f"Session Distance: {self.total_distance:.2f} miles")
+        print(f"Today's Total Distance: {self.today_distance + self.total_distance:.2f} miles")
+        print(f"Yesterday's Distance: {self.yesterday_distance:.2f} miles")
         print(f"Last Speed: {self.current_speed:.2f} mph")
+        print(f"Max Speed: {self.max_speed:.2f} mph")
+        
+        avg_speed = self.speed_sum / self.speed_count if self.speed_count > 0 else 0
+        print(f"Average Speed: {avg_speed:.2f} mph")
+        
+        session_duration = time.time() - self.session_start_time
+        hours, remainder = divmod(int(session_duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"Session Duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
         
         sys.exit(0)  # Exit immediately
     
     def cleanup(self) -> None:
         """Clean up resources before exiting."""
+        # Close ANT+ connections
         if self.fitness_equipment:
             try:
                 self.fitness_equipment.close_channel()
@@ -303,6 +507,16 @@ class SpeedDisplayApp:
                 self.node = None
             except Exception as e:
                 logger.error(f"Error stopping ANT+ node: {e}")
+        
+        # Update today's distance in the database if significant
+        if self.db_connected and self.total_distance > 0.02:
+            try:
+                self.db.update_today_distance(self.device_id, self.total_distance)
+            except Exception as e:
+                logger.error(f"Error updating today's distance: {e}")
+            
+            # Close the database
+            self.db.close()
     
     def initialize_ant(self) -> bool:
         """Initialize ANT+ node and fitness equipment device."""
@@ -351,6 +565,11 @@ class SpeedDisplayApp:
         print("----------------------------------------------")
         print(f"Looking for devices with ID: {self.device_id}")
         
+        if self.db_connected:
+            print(f"Database connected. Today's distance: {self.today_distance:.2f} miles, Yesterday's: {self.yesterday_distance:.2f} miles")
+        else:
+            print("Warning: Database not connected. Distance will not be saved.")
+        
         try:
             # Initialize ANT+ node and equipment
             if not self.initialize_ant():
@@ -362,6 +581,8 @@ class SpeedDisplayApp:
             # Keep the script running until exit_flag is set
             connection_check_interval = 10  # seconds
             last_connection_check = time.time()
+            last_db_update_time = time.time()
+            last_db_update_distance = 0.0
             
             while not self.exit_flag:
                 time.sleep(0.1)  # Shorter sleep time for quicker response to Ctrl+C
@@ -378,6 +599,17 @@ class SpeedDisplayApp:
                         if not self.attempt_reconnect():
                             print("Failed to reconnect after multiple attempts. Exiting.")
                             return 1
+                
+                # Periodically update the database if we've traveled more than 0.02 miles since last update
+                if self.db_connected and (current_time - last_db_update_time > 60):  # Update at most once per minute
+                    distance_since_last_update = self.total_distance - last_db_update_distance
+                    if distance_since_last_update > 0.02:
+                        if self.db.update_today_distance(self.device_id, distance_since_last_update):
+                            # Update was successful
+                            self.today_distance += distance_since_last_update
+                            last_db_update_distance = self.total_distance
+                            logger.debug(f"Updated database with {distance_since_last_update:.2f} miles")
+                        last_db_update_time = current_time
             
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
@@ -407,7 +639,59 @@ def parse_arguments():
         action='store_true',
         help='Enable verbose logging'
     )
+    parser.add_argument(
+        '--db-path',
+        type=str,
+        default=DEFAULT_DB_PATH,
+        help=f'Path to SQLite database file (default: {DEFAULT_DB_PATH})'
+    )
+    parser.add_argument(
+        '--stats',
+        action='store_true',
+        help='Display distance statistics and exit'
+    )
     return parser.parse_args()
+
+
+def display_stats(db_path: str) -> None:
+    """Display distance statistics from the database."""
+    db = Database(db_path)
+    if not db.connect():
+        print("Error: Could not connect to database.")
+        return
+    
+    stats = db.get_stats()
+    if not stats:
+        print("No distance data found.")
+        return
+    
+    print("\nDistance Statistics")
+    print("-----------------")
+    for stat in stats:
+        device_id, date, distance, last_updated = stat
+        
+        # Format the date nicely
+        if date == datetime.now().date().isoformat():
+            date_str = "Today"
+        elif date == (datetime.now().date() - datetime.timedelta(days=1)).isoformat():
+            date_str = "Yesterday"
+        else:
+            date_str = date
+        
+        # Format the last updated time
+        if isinstance(last_updated, str):
+            last_updated_dt = datetime.fromisoformat(last_updated)
+        else:
+            last_updated_dt = last_updated
+        last_updated_str = last_updated_dt.strftime("%I:%M %p")
+        
+        print(f"Device ID: {device_id}")
+        print(f"Date: {date_str}")
+        print(f"Distance: {distance:.2f} miles")
+        print(f"Last Updated: {last_updated_str}")
+        print("-----------------")
+    
+    db.close()
 
 
 def main():
@@ -419,8 +703,13 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     
+    # If stats flag is set, display stats and exit
+    if args.stats:
+        display_stats(args.db_path)
+        return 0
+    
     # Create and run the application
-    app = SpeedDisplayApp(device_id=args.device_id)
+    app = SpeedDisplayApp(device_id=args.device_id, db_path=args.db_path)
     return app.run()
 
 
