@@ -1,8 +1,9 @@
 #!./venv/bin/python3
 """
 ANT+ Speed Display for Fitness Equipment
-Displays speed data from ANT+ fitness equipment in large text on the terminal
+Displays speed data and distance traveled from ANT+ fitness equipment in large text on the terminal
 Specifically looks for devices with ID 13500 by default
+Uses imperial units (mph and miles)
 """
 
 import sys
@@ -26,6 +27,14 @@ except ImportError:
 logging.basicConfig(level=logging.WARN, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('ant_scanner')
+
+# Global variables
+node = None
+fitness_equipment = None
+exit_flag = False
+total_distance = 0.0  # Total distance in miles
+last_update_time = None  # Last time we received speed data
+current_speed = 0.0  # Current speed in mph
 
 # Default target device ID
 DEFAULT_DEVICE_ID = 13500
@@ -142,45 +151,102 @@ BIG_NUMBERS = {
     ]
 }
 
-# Global variables
-node = None
-fitness_equipment = None
-exit_flag = False
+# Conversion constants
+KM_TO_MILES = 0.621371  # Conversion factor from kilometers to miles
 
-def display_big_text(text):
-    """Display text in big ASCII art."""
+def display_big_text(speed_text, distance_text):
+    """Display speed and distance in big ASCII art with units in small text."""
     # Clear the terminal
     os.system('clear' if os.name == 'posix' else 'cls')
     
-    # Convert text to big ASCII art
-    lines = [""] * 7
-    for char in text:
+    # Convert speed and distance to big ASCII art
+    speed_lines = [""] * 7
+    for char in speed_text:
         if char in BIG_NUMBERS:
             for i in range(7):
-                lines[i] += BIG_NUMBERS[char][i] + " "
+                speed_lines[i] += BIG_NUMBERS[char][i] + " "
         else:
             # For characters not in our dictionary, use space
             for i in range(7):
-                lines[i] += BIG_NUMBERS[' '][i] + " "
+                speed_lines[i] += BIG_NUMBERS[' '][i] + " "
     
-    # Print the big text
-    print("\n" * 3)  # Add some space at the top
-    for line in lines:
-        print(line)
-    print("\n" * 3)  # Add some space at the bottom
+    distance_lines = [""] * 7
+    for char in distance_text:
+        if char in BIG_NUMBERS:
+            for i in range(7):
+                distance_lines[i] += BIG_NUMBERS[char][i] + " "
+        else:
+            # For characters not in our dictionary, use space
+            for i in range(7):
+                distance_lines[i] += BIG_NUMBERS[' '][i] + " "
+    
+    # Print the big text with headers and units
+    print("\n" * 2)  # Add some space at the top
+    
+    # Print speed header
+    print("SPEED:")
+    
+    # Print speed with units
+    for i, line in enumerate(speed_lines):
+        if i == 3:  # Middle line, add units
+            print(f"{line}  mph")
+        else:
+            print(line)
+    
+    print("\n")  # Add space between speed and distance
+    
+    # Print distance header
+    print("DISTANCE:")
+    
+    # Print distance with units
+    for i, line in enumerate(distance_lines):
+        if i == 3:  # Middle line, add units
+            print(f"{line}  mi")
+        else:
+            print(line)
+    
+    print("\n")  # Add some space at the bottom
+
+def calculate_distance(speed_mph, elapsed_seconds):
+    """Calculate distance traveled based on speed and time."""
+    # Convert mph to miles/second, then multiply by elapsed seconds
+    return (speed_mph / 3600.0) * elapsed_seconds
+
+def update_display():
+    """Update the terminal display with current speed and distance."""
+    # Format speed to 2 decimal places
+    speed_text = f"{current_speed:.2f}"
+    
+    # Format distance to 2 decimal places
+    distance_text = f"{total_distance:.2f}"
+    
+    # Display both speed and distance
+    display_big_text(speed_text, distance_text)
 
 def on_fitness_equipment_data(page: int, page_name: str, data: FitnessEquipmentData):
     """Callback for receiving fitness equipment data."""
+    global last_update_time, total_distance, current_speed
+    
     # Only process data if it's from the general_fe page (page 16)
     if page_name == "general_fe":
-        # Convert speed from m/s to km/h
-        speed_kmh = data.speed * 3.6
+        # Get current time
+        current_time = time.time()
         
-        # Format speed to 2 decimal places
-        speed_text = f"{speed_kmh:.2f}"
+        # Convert speed from m/s to mph
+        # First convert to km/h (multiply by 3.6), then to mph (multiply by KM_TO_MILES)
+        current_speed = data.speed * 3.6 * KM_TO_MILES
         
-        # Display speed in big text
-        display_big_text(speed_text)
+        # Calculate distance if we have a previous update
+        if last_update_time is not None:
+            elapsed_seconds = current_time - last_update_time
+            distance = calculate_distance(current_speed, elapsed_seconds)
+            total_distance += distance
+        
+        # Update last update time
+        last_update_time = current_time
+        
+        # Update display
+        update_display()
 
 def on_device_found(device):
     """Callback when a device is found."""
@@ -194,6 +260,12 @@ def signal_handler(sig, frame):
     print("\nExiting...", end="", flush=True)
     cleanup()
     print(" Done!")
+    
+    # Show final stats
+    print(f"\nFinal Stats:")
+    print(f"Total Distance: {total_distance:.2f} miles")
+    print(f"Last Speed: {current_speed:.2f} mph")
+    
     sys.exit(0)  # Exit immediately
 
 def cleanup():
@@ -238,8 +310,8 @@ def main():
     # Set up signal handler for clean exit
     signal.signal(signal.SIGINT, signal_handler)
     
-    print("ANT+ Fitness Equipment Speed Display")
-    print("------------------------------------")
+    print("ANT+ Fitness Equipment Speed & Distance Display")
+    print("----------------------------------------------")
     print(f"Looking for devices with ID: {device_id}")
     
     try:
