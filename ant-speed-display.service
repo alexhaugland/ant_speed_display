@@ -1,0 +1,14 @@
+[Unit]
+Description=ANT+ Speed Display
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/github/ant_speed_display
+ExecStart=/home/pi/github/ant_speed_display/venv/bin/python /home/pi/github/ant_speed_display/speed_display.py --no-terminal --mqtt-host localhost
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target 

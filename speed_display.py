@@ -2,6 +2,7 @@
 """
 ANT+ Speed Display for Fitness Equipment
 Displays speed data and distance traveled from ANT+ fitness equipment in large text on the terminal
+and/or sends data to Home Assistant via MQTT
 Specifically looks for devices with ID 13500 by default
 Uses imperial units (mph and miles)
 """
@@ -10,7 +11,6 @@ import sys
 import time
 import os
 import signal
-import argparse
 import sqlite3
 from datetime import datetime, date, timedelta
 import logging
@@ -26,13 +26,15 @@ except ImportError:
     print("Please install the required packages with: pip install -r requirements.txt")
     sys.exit(1)
 
+# Import our modules
+from terminal_display import TerminalDisplay
+from mqtt_ha import MQTTHomeAssistant
+from config import load_config, Config
+
 # Configure logging
 logging.basicConfig(level=logging.WARN, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('ant_scanner')
-
-# Default target device ID
-DEFAULT_DEVICE_ID = 13500
 
 # Conversion constants
 KM_TO_MILES = 0.621371  # Conversion factor from kilometers to miles
@@ -41,118 +43,6 @@ MS_TO_KMH = 3.6  # Conversion factor from m/s to km/h
 # Database constants
 DEFAULT_DB_PATH = os.path.expanduser("~/.ant_speed_display.db")
 DB_TABLE_NAME = "daily_distance"
-
-# ASCII art numbers for big text display
-BIG_NUMBERS = {
-    '0': [
-        "  ███  ",
-        " █   █ ",
-        "█     █",
-        "█     █",
-        "█     █",
-        " █   █ ",
-        "  ███  "
-    ],
-    '1': [
-        "   █   ",
-        "  ██   ",
-        " █ █   ",
-        "   █   ",
-        "   █   ",
-        "   █   ",
-        " █████ "
-    ],
-    '2': [
-        " ████  ",
-        "█    █ ",
-        "     █ ",
-        "  ███  ",
-        " █     ",
-        "█      ",
-        "██████ "
-    ],
-    '3': [
-        " ████  ",
-        "█    █ ",
-        "     █ ",
-        "  ███  ",
-        "     █ ",
-        "█    █ ",
-        " ████  "
-    ],
-    '4': [
-        "█   █  ",
-        "█   █  ",
-        "█   █  ",
-        "██████ ",
-        "    █  ",
-        "    █  ",
-        "    █  "
-    ],
-    '5': [
-        "██████ ",
-        "█      ",
-        "█      ",
-        "█████  ",
-        "     █ ",
-        "█    █ ",
-        " ████  "
-    ],
-    '6': [
-        "  ███  ",
-        " █     ",
-        "█      ",
-        "█████  ",
-        "█    █ ",
-        "█    █ ",
-        " ████  "
-    ],
-    '7': [
-        "██████ ",
-        "     █ ",
-        "    █  ",
-        "   █   ",
-        "  █    ",
-        " █     ",
-        "█      "
-    ],
-    '8': [
-        " ████  ",
-        "█    █ ",
-        "█    █ ",
-        " ████  ",
-        "█    █ ",
-        "█    █ ",
-        " ████  "
-    ],
-    '9': [
-        " ████  ",
-        "█    █ ",
-        "█    █ ",
-        " █████ ",
-        "     █ ",
-        "    █  ",
-        " ███   "
-    ],
-    '.': [
-        "       ",
-        "       ",
-        "       ",
-        "       ",
-        "       ",
-        "   ██  ",
-        "   ██  "
-    ],
-    ' ': [
-        "       ",
-        "       ",
-        "       ",
-        "       ",
-        "       ",
-        "       ",
-        "       "
-    ]
-}
 
 
 class Database:
@@ -306,8 +196,10 @@ class Statistics:
         self.session_start_time = time.time()
         self.current_speed = 0.0
         self.max_speed = 0.0
-        self.speed_sum = 0.0
-        self.speed_count = 0
+        
+        # 5-minute rolling average for speed (300 seconds)
+        self.speed_history = []  # List of (timestamp, speed) tuples
+        self.ROLLING_AVG_WINDOW = 300  # 5 minutes in seconds
         
         # Date tracking
         self.current_date = datetime.now().date()
@@ -385,9 +277,13 @@ class Statistics:
         if speed_mph > self.max_speed:
             self.max_speed = speed_mph
         
-        # Update average speed calculation
-        self.speed_sum += speed_mph
-        self.speed_count += 1
+        # Update rolling average speed calculation
+        current_time = time.time()
+        self.speed_history.append((current_time, speed_mph))
+        
+        # Remove entries older than the rolling window
+        cutoff_time = current_time - self.ROLLING_AVG_WINDOW
+        self.speed_history = [entry for entry in self.speed_history if entry[0] >= cutoff_time]
     
     def add_distance(self, distance_miles: float) -> None:
         """Add distance to the current session."""
@@ -417,8 +313,13 @@ class Statistics:
             return False
     
     def get_avg_speed(self) -> float:
-        """Get the average speed for the current session."""
-        return self.speed_sum / self.speed_count if self.speed_count > 0 else 0.0
+        """Get the average speed over the last 5 minutes."""
+        if not self.speed_history:
+            return 0.0
+        
+        # Calculate average of all speeds in the history
+        total_speed = sum(speed for _, speed in self.speed_history)
+        return total_speed / len(self.speed_history) if self.speed_history else 0.0
     
     def get_session_duration(self) -> int:
         """Get the session duration in seconds."""
@@ -442,9 +343,10 @@ class Statistics:
 class SpeedDisplayApp:
     """Main application class for ANT+ Speed Display."""
     
-    def __init__(self, device_id: int = DEFAULT_DEVICE_ID, db_path: str = DEFAULT_DB_PATH):
-        """Initialize the application with the specified device ID."""
-        self.device_id = device_id
+    def __init__(self, config: Config):
+        """Initialize the application with the specified configuration."""
+        self.config = config
+        self.device_id = config.device_id
         self.node: Optional[Node] = None
         self.fitness_equipment: Optional[FitnessEquipment] = None
         self.exit_flag = False
@@ -454,75 +356,38 @@ class SpeedDisplayApp:
         self.reconnect_delay = 2  # seconds
         
         # Database setup
-        self.db = Database(db_path)
+        self.db = Database(config.db_path)
         self.db_connected = self.db.connect()
         
         # Statistics tracking
-        self.stats = Statistics(device_id, self.db if self.db_connected else None)
+        self.stats = Statistics(self.device_id, self.db if self.db_connected else None)
+        
+        # Terminal display setup
+        self.terminal_display = None
+        if config.use_terminal_display:
+            self.terminal_display = TerminalDisplay()
+        
+        # MQTT and Home Assistant setup
+        self.mqtt_ha = None
+        if config.use_mqtt and config.mqtt_host:
+            self.mqtt_ha = MQTTHomeAssistant(
+                mqtt_host=config.mqtt_host,
+                mqtt_port=config.mqtt_port,
+                mqtt_username=config.mqtt_username,
+                mqtt_password=config.mqtt_password,
+                mqtt_client_id=config.mqtt_client_id,
+                device_name=config.device_name,
+                device_id=self.device_id
+            )
+            self.mqtt_connected = self.mqtt_ha.connect()
+        else:
+            self.mqtt_connected = False
         
         # Set up signal handler for clean exit
         signal.signal(signal.SIGINT, self._signal_handler)
     
-    def display_big_text(self, speed_text: str, distance_text: str) -> None:
-        """Display speed and distance in big ASCII art with units in small text."""
-        # Clear the terminal
-        os.system('clear' if os.name == 'posix' else 'cls')
-        
-        # Convert speed and distance to big ASCII art
-        speed_lines = [""] * 7
-        for char in speed_text:
-            if char in BIG_NUMBERS:
-                for i in range(7):
-                    speed_lines[i] += BIG_NUMBERS[char][i] + " "
-            else:
-                # For characters not in our dictionary, use space
-                for i in range(7):
-                    speed_lines[i] += BIG_NUMBERS[' '][i] + " "
-        
-        distance_lines = [""] * 7
-        for char in distance_text:
-            if char in BIG_NUMBERS:
-                for i in range(7):
-                    distance_lines[i] += BIG_NUMBERS[char][i] + " "
-            else:
-                # For characters not in our dictionary, use space
-                for i in range(7):
-                    distance_lines[i] += BIG_NUMBERS[' '][i] + " "
-        
-        # Print the big text with headers and units
-        print("\n" * 2)  # Add some space at the top
-        
-        # Print speed header
-        print("SPEED:")
-        
-        # Print speed with units
-        for i, line in enumerate(speed_lines):
-            if i == 3:  # Middle line, add units
-                print(f"{line}  mph")
-            else:
-                print(line)
-        
-        print("\n")  # Add space between speed and distance
-        
-        # Print distance header
-        print("DISTANCE (session / today / yesterday):")
-        
-        # Print distance with units
-        for i, line in enumerate(distance_lines):
-            if i == 3:  # Middle line, add units
-                print(f"{line}  mi / {self.stats.get_total_today_distance():.2f} mi / {self.stats.yesterday_distance:.2f} mi")
-            else:
-                print(line)
-        
-        print("\n")  # Add some space at the bottom
-    
-    def calculate_distance(self, speed_mph: float, elapsed_seconds: float) -> float:
-        """Calculate distance traveled based on speed and time."""
-        # Convert mph to miles/second, then multiply by elapsed seconds
-        return (speed_mph / 3600.0) * elapsed_seconds
-    
     def update_display(self) -> None:
-        """Update the terminal display with current speed and distance."""
+        """Update the terminal display and/or MQTT with current speed and distance."""
         try:
             # Format speed to 2 decimal places
             speed_text = f"{self.stats.current_speed:.2f}"
@@ -530,8 +395,24 @@ class SpeedDisplayApp:
             # Format distance to 2 decimal places
             distance_text = f"{self.stats.session_distance:.2f}"
             
-            # Display both speed and distance
-            self.display_big_text(speed_text, distance_text)
+            # Update terminal display if enabled
+            if self.terminal_display:
+                self.terminal_display.display_big_text(
+                    speed_text, 
+                    distance_text, 
+                    self.stats.get_total_today_distance(),
+                    self.stats.yesterday_distance
+                )
+            
+            # Update MQTT if connected
+            if self.mqtt_connected:
+                self.mqtt_ha.update_all(
+                    self.stats.current_speed,
+                    self.stats.get_total_today_distance(),
+                    self.stats.yesterday_distance,
+                    self.stats.max_speed,
+                    self.stats.get_avg_speed()
+                )
         except Exception as e:
             logger.error(f"Error updating display: {e}")
     
@@ -580,14 +461,16 @@ class SpeedDisplayApp:
         print(" Done!")
         
         # Show final stats
-        print(f"\nFinal Stats:")
-        print(f"Session Distance: {self.stats.session_distance:.2f} miles")
-        print(f"Today's Total Distance: {self.stats.get_total_today_distance():.2f} miles")
-        print(f"Yesterday's Distance: {self.stats.yesterday_distance:.2f} miles")
-        print(f"Last Speed: {self.stats.current_speed:.2f} mph")
-        print(f"Max Speed: {self.stats.max_speed:.2f} mph")
-        print(f"Average Speed: {self.stats.get_avg_speed():.2f} mph")
-        print(f"Session Duration: {self.stats.get_formatted_session_duration()}")
+        if self.terminal_display:
+            self.terminal_display.display_final_stats(
+                self.stats.session_distance,
+                self.stats.get_total_today_distance(),
+                self.stats.yesterday_distance,
+                self.stats.current_speed,
+                self.stats.max_speed,
+                self.stats.get_avg_speed(),
+                self.stats.get_formatted_session_duration()
+            )
         
         sys.exit(0)  # Exit immediately
     
@@ -617,6 +500,18 @@ class SpeedDisplayApp:
             
             # Close the database
             self.db.close()
+        
+        # Disconnect from MQTT
+        if self.mqtt_connected:
+            try:
+                self.mqtt_ha.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting from MQTT: {e}")
+    
+    def calculate_distance(self, speed_mph: float, elapsed_seconds: float) -> float:
+        """Calculate distance traveled based on speed and time."""
+        # Convert mph to miles/second, then multiply by elapsed seconds
+        return (speed_mph / 3600.0) * elapsed_seconds
     
     def initialize_ant(self) -> bool:
         """Initialize ANT+ node and fitness equipment device."""
@@ -670,6 +565,19 @@ class SpeedDisplayApp:
         else:
             print("Warning: Database not connected. Distance will not be saved.")
         
+        if self.terminal_display:
+            print("Terminal display enabled.")
+        else:
+            print("Terminal display disabled.")
+        
+        if self.mqtt_connected:
+            print(f"MQTT connected to {self.config.mqtt_host}. Data will be sent to Home Assistant.")
+        else:
+            if self.config.use_mqtt:
+                print(f"Warning: MQTT connection failed. Data will not be sent to Home Assistant.")
+            else:
+                print("MQTT disabled. Data will not be sent to Home Assistant.")
+        
         try:
             # Initialize ANT+ node and equipment
             if not self.initialize_ant():
@@ -719,36 +627,6 @@ class SpeedDisplayApp:
         return 0
 
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description='Display speed data from ANT+ fitness equipment in large text.'
-    )
-    parser.add_argument(
-        '-d', '--device-id', 
-        type=int, 
-        default=DEFAULT_DEVICE_ID,
-        help=f'ANT+ device ID to connect to (default: {DEFAULT_DEVICE_ID})'
-    )
-    parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='Enable verbose logging'
-    )
-    parser.add_argument(
-        '--db-path',
-        type=str,
-        default=DEFAULT_DB_PATH,
-        help=f'Path to SQLite database file (default: {DEFAULT_DB_PATH})'
-    )
-    parser.add_argument(
-        '--stats',
-        action='store_true',
-        help='Display distance statistics and exit'
-    )
-    return parser.parse_args()
-
-
 def display_stats(db_path: str) -> None:
     """Display distance statistics from the database."""
     db = Database(db_path)
@@ -792,20 +670,20 @@ def display_stats(db_path: str) -> None:
 
 def main():
     """Main entry point for the application."""
-    # Parse command line arguments
-    args = parse_arguments()
+    # Load configuration
+    config = load_config()
     
     # Set logging level based on verbose flag
-    if args.verbose:
+    if config.verbose:
         logger.setLevel(logging.DEBUG)
     
     # If stats flag is set, display stats and exit
-    if args.stats:
-        display_stats(args.db_path)
+    if config.stats_only:
+        display_stats(config.db_path)
         return 0
     
     # Create and run the application
-    app = SpeedDisplayApp(device_id=args.device_id, db_path=args.db_path)
+    app = SpeedDisplayApp(config)
     return app.run()
 
 
