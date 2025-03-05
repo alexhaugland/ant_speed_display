@@ -41,7 +41,7 @@ KM_TO_MILES = 0.621371  # Conversion factor from kilometers to miles
 MS_TO_KMH = 3.6  # Conversion factor from m/s to km/h
 
 # Database constants
-DEFAULT_DB_PATH = os.path.expanduser("~/.ant_speed_display.db")
+DEFAULT_DB_PATH = "~/.ant_speed_display.db"
 DB_TABLE_NAME = "daily_distance"
 
 
@@ -50,7 +50,7 @@ class Database:
     
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         """Initialize the database connection."""
-        self.db_path = db_path
+        self.db_path = os.path.expanduser(db_path)
         self.conn = None
         self.cursor = None
         
